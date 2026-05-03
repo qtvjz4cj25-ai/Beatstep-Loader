@@ -420,7 +420,7 @@ struct ContentView: View {
                 Button {
                     Task { await model.previewAssignedTracks() }
                 } label: {
-                    Text(model.isSending ? "Sending..." : "Preview Assigned Tracks")
+                    Text(model.isSending ? "Sending..." : "Preview Assigned Tracks (No BSP Capture)")
                         .font(.system(size: 14, weight: .bold, design: .monospaced))
                         .frame(maxWidth: .infinity, minHeight: 42)
                 }
@@ -444,6 +444,9 @@ struct ContentView: View {
             Text("Capture mode sends the lane on the BSP Record Input Channel. Preview uses the Intended BSP Output Channel so the two roles stay separate in the model.")
                 .font(.monoSm)
                 .foregroundStyle(Color.dimText)
+            Text("If you want the BSP to record, use the SEQ 1 / SEQ 2 / DRUM send buttons, not Preview Assigned Tracks.")
+                .font(.monoSm)
+                .foregroundStyle(Color.accent.opacity(0.9))
         }
     }
 

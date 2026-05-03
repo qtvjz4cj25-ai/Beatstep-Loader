@@ -2,15 +2,16 @@
 //  BeatstepModel.swift
 //  Beatstep-Loader
 //
-//  Data models + ViewModel. Calls Python backend via subprocess.
+//  Display models + ViewModel.
+//  Uses native Swift MIDIEngine — no Python required.
 //
 
 import Foundation
 import Observation
 
-// MARK: - Data Models
+// MARK: - Display models
 
-struct MIDITrack: Codable, Identifiable, Hashable {
+struct MIDITrack: Identifiable, Hashable {
     var id: Int { index }
     let index: Int
     let name: String
@@ -32,122 +33,145 @@ struct MIDITrack: Codable, Identifiable, Hashable {
         let names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
         return "\(names[n % 12])\((n / 12) - 1)"
     }
-}
 
-struct MIDIFileInfo: Codable {
-    let type: Int
-    let ticksPerBeat: Int
-    let tracks: [MIDITrack]
+    init(from data: MIDITrackData) {
+        self.index     = data.index
+        self.name      = data.name
+        self.channels  = data.channels.sorted().map { Int($0) }
+        self.noteMin   = data.noteMin.map { Int($0) }
+        self.noteMax   = data.noteMax.map { Int($0) }
+        self.noteCount = data.noteCount
+    }
 }
 
 // MARK: - ViewModel
 
 @Observable
 final class BeatstepModel {
+
+    // Display
     var fileURL: URL?
-    var midiInfo: MIDIFileInfo?
+    var tracks: [MIDITrack] = []
     var seq1Index: Int? = nil
     var seq2Index: Int? = nil
     var drumIndex: Int? = nil
-    var availablePorts: [String] = []
-    var selectedPort: String = ""
     var logLines: [String] = []
-    var isLoading = false
-    var isSending = false
+    var isLoading  = false
+    var isSending  = false
 
-    var tracks: [MIDITrack] { midiInfo?.tracks ?? [] }
+    // Capture settings (drives quantize, clock, loop, count-in)
+    var capture = CaptureSettings()
+
+    // MIDI engine
+    let midi = CoreMIDIEngine()
+
+    // Raw track data for playback
+    private var trackDataMap: [Int: MIDITrackData] = [:]
+    private var ticksPerBeat: UInt16 = 480
+
+    // Loop stop flag
+    private var stopRequested = false
+
     var fileName: String { fileURL?.lastPathComponent ?? "No file selected" }
 
-    // MARK: Python bridge
-
-    /// Path to the real python3 binary, resolved once at startup via the user's login shell.
-    private var python3Path: String = ""
-
-    /// Runs `zsh -l -c "which python3"` so Homebrew's PATH is loaded exactly as in the terminal.
-    private func findPython() async {
-        if let path = try? await run("/bin/zsh", args: ["-l", "-c", "which python3"]),
-           !path.isEmpty {
-            python3Path = path
-            log("Python: \(path)")
-        } else {
-            log("python3 not found — run: brew install python && pip3 install mido python-rtmidi")
-        }
-    }
-
-    private var scriptsDir: String {
-        // Use bundle resources if available (production), else fall back to source dir (dev)
-        if let rp = Bundle.main.resourcePath,
-           FileManager.default.fileExists(atPath: rp + "/parser.py") {
-            return rp + "/"
-        }
-        return "/Users/i3bus/Documents/Beatstep-Loader/Beatstep-Loader/"
-    }
+    // BSP output channels (0-indexed)
+    private let bspChannels: [String: UInt8] = [
+        "SEQ1": 0,  // MIDI ch 1
+        "SEQ2": 1,  // MIDI ch 2
+        "DRUM": 9,  // MIDI ch 10
+    ]
 
     // MARK: Actions
 
     func loadFile(_ url: URL) async {
-        fileURL = url
+        fileURL  = url
         isLoading = true
         log("Loading \(url.lastPathComponent)…")
         do {
-            let json = try await run(python3Path, args: [scriptsDir + "parser.py", "--json", url.path])
-            let info = try JSONDecoder().decode(MIDIFileInfo.self, from: Data(json.utf8))
-            midiInfo = info
-            autoAssign(info.tracks)
-            log("Loaded \(info.tracks.count) track(s). Auto-assignment applied.")
+            let (tpb, rawTracks) = try MIDIFileParser.parse(url)
+            ticksPerBeat = tpb
+            trackDataMap = Dictionary(uniqueKeysWithValues: rawTracks.map { ($0.index, $0) })
+            tracks = rawTracks.map { MIDITrack(from: $0) }
+            autoAssign(tracks)
+            log("Loaded \(tracks.count) track(s)  (\(tpb) ticks/beat)")
         } catch {
             log("Error: \(error.localizedDescription)")
         }
         isLoading = false
     }
 
-    func refreshPorts() async {
-        await findPython()
-        guard !python3Path.isEmpty else { return }
-        log("Scanning MIDI ports…")
-        do {
-            let json = try await run(python3Path, args: [
-                "-c", "import mido,json;print(json.dumps(mido.get_output_names()))"
-            ])
-            let ports = try JSONDecoder().decode([String].self, from: Data(json.utf8))
-            availablePorts = ports
-            if let bsp = ports.first(where: { $0.localizedCaseInsensitiveContains("beatstep") }) {
-                selectedPort = bsp
-                log("BeatStep Pro detected: \(bsp)")
-            } else if selectedPort.isEmpty, let first = ports.first {
-                selectedPort = first
-            }
-            log("Found \(ports.count) port(s).")
-        } catch {
-            log("Port scan error: \(error.localizedDescription)")
+    func refreshPorts() {
+        midi.refreshDestinations()
+        if let bsp = midi.bspDestination() {
+            log("BeatStep Pro detected: \(bsp.name)")
+        } else {
+            log("Found \(midi.destinations.count) MIDI port(s).")
         }
     }
 
-    func sendTracks() async {
-        guard let url = fileURL, !selectedPort.isEmpty else { return }
-        isSending = true
-        log("Sending to \"\(selectedPort)\"…")
-        var args = [url.path, selectedPort]
-        if let i = seq1Index { args += ["--seq1", "\(i)"] }
-        if let i = seq2Index { args += ["--seq2", "\(i)"] }
-        if let i = drumIndex { args += ["--drum", "\(i)"] }
-        do {
-            let out = try await run(python3Path, args: [scriptsDir + "sender.py"] + args)
-            log(out.isEmpty ? "All tracks sent." : out)
-        } catch {
-            log("Send error: \(error.localizedDescription)")
-        }
+    func stopSending() {
+        stopRequested = true
+    }
+
+    /// Send a single lane — quantized, monophonic, with clock + count-in.
+    func sendLane(_ lane: String, to destName: String) async {
+        guard let dest = midi.destinations.first(where: { $0.name == destName }),
+              let idx  = laneIndex(lane),
+              let td   = trackDataMap[idx]
+        else { log("\(lane): nothing to send"); return }
+
+        isSending     = true
+        stopRequested = false
+
+        let notes = preprocess(td)
+        log("\(lane) → \"\(td.name)\"  \(notes.count) steps  \(capture.patternSteps)×1/\(capture.gridDivision)")
+        if capture.countIn { log("Count-in: 1 bar…") }
+        if capture.loop     { log("Looping — press Stop to end.") }
+
+        await midi.captureToLane(notes, to: dest,
+                                 outputChannel: bspChannels[lane] ?? 0,
+                                 ticksPerBeat: ticksPerBeat,
+                                 settings: capture,
+                                 stopSignal: { self.stopRequested })
+        log("\(lane): done")
         isSending = false
     }
+
+    /// Send all lanes simultaneously (for preview/playback, no clock).
+    func sendAllParallel(to destName: String) async {
+        guard let dest = midi.destinations.first(where: { $0.name == destName }) else {
+            log("Port not found: \(destName)"); return
+        }
+        isSending = true
+        log("Sending all lanes in parallel to \"\(dest.name)\"…")
+
+        await withTaskGroup(of: Void.self) { group in
+            for lane in ["SEQ1", "SEQ2", "DRUM"] {
+                guard let idx = laneIndex(lane), let td = trackDataMap[idx] else { continue }
+                let ch  = bspChannels[lane] ?? 0
+                let tpb = ticksPerBeat
+                group.addTask {
+                    await self.midi.sendTrack(td, to: dest, outputChannel: ch, ticksPerBeat: tpb)
+                }
+                log("  \(lane) → Track \(idx): \"\(td.name)\"")
+            }
+        }
+        isSending = false
+        log("All lanes sent.")
+    }
+
+    // MARK: Auto-assign
 
     func autoAssign(_ tracks: [MIDITrack]) {
         var pool = tracks
         seq1Index = nil; seq2Index = nil; drumIndex = nil
 
-        // DRUM: ch10 (idx 9) or GM drum note range
+        // DRUM: ch10 (idx 9), or GM drum note range 35–81
         if let t = pool.first(where: { $0.channels.contains(9) }) {
             drumIndex = t.index; pool.removeAll { $0.id == t.id }
-        } else if let t = pool.first(where: { ($0.noteMin ?? 0) >= 35 && ($0.noteMax ?? 127) <= 81 }) {
+        } else if let t = pool.first(where: {
+            ($0.noteMin ?? 0) >= 35 && ($0.noteMax ?? 127) <= 81
+        }) {
             drumIndex = t.index; pool.removeAll { $0.id == t.id }
         }
 
@@ -163,38 +187,22 @@ final class BeatstepModel {
 
     // MARK: Private
 
+    private func preprocess(_ td: MIDITrackData) -> [QuantizedNote] {
+        MIDIPreprocessor(settings: capture, ticksPerBeat: ticksPerBeat).process(td)
+    }
+
+    private func laneIndex(_ lane: String) -> Int? {
+        switch lane {
+        case "SEQ1": return seq1Index
+        case "SEQ2": return seq2Index
+        case "DRUM": return drumIndex
+        default:     return nil
+        }
+    }
+
+    func log(_ msg: String) { logLines.append(msg) }
+
     private func avgNote(_ t: MIDITrack) -> Int {
         ((t.noteMin ?? 0) + (t.noteMax ?? 0)) / 2
-    }
-
-    func log(_ msg: String) {
-        logLines.append(msg)
-    }
-
-    private func run(_ executable: String, args: [String]) async throws -> String {
-        try await withCheckedThrowingContinuation { continuation in
-            let process = Process()
-            let outPipe = Pipe()
-            let errPipe = Pipe()
-            process.executableURL = URL(fileURLWithPath: executable)
-            process.arguments = args
-            process.standardOutput = outPipe
-            process.standardError = errPipe
-            process.terminationHandler = { p in
-                let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                if p.terminationStatus == 0 {
-                    continuation.resume(returning: out)
-                } else {
-                    let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? "Unknown error"
-                    continuation.resume(throwing: NSError(
-                        domain: "BeatstepLoader", code: Int(p.terminationStatus),
-                        userInfo: [NSLocalizedDescriptionKey: err]
-                    ))
-                }
-            }
-            do { try process.run() } catch { continuation.resume(throwing: error) }
-        }
     }
 }

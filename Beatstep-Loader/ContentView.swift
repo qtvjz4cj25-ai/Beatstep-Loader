@@ -26,7 +26,7 @@ struct ContentView: View {
     @State private var model = BeatstepModel()
     @State private var showFilePicker = false
     @State private var isDragTarget = false
-    @State private var logScrollID: String?
+    @State private var selectedPort = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -39,6 +39,7 @@ struct ContentView: View {
                     if !model.tracks.isEmpty {
                         assignmentSection
                     }
+                    captureSettingsSection
                     portSection
                     sendSection
                     logSection
@@ -49,7 +50,7 @@ struct ContentView: View {
         .frame(minWidth: 700, minHeight: 620)
         .background(Color.bg)
         .foregroundStyle(Color.white)
-        .task { await model.refreshPorts() }
+        .onAppear { model.refreshPorts() }
         .fileImporter(
             isPresented: $showFilePicker,
             allowedContentTypes: [UTType(filenameExtension: "mid") ?? .data,
@@ -187,46 +188,165 @@ struct ContentView: View {
         .cornerRadius(8)
     }
 
+    // MARK: Capture settings
+
+    private var captureSettingsSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionLabel("Capture Settings")
+
+            // Row 1: BPM + Pattern Length
+            HStack(spacing: 16) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("BPM").font(.monoSm).foregroundStyle(Color.dimText)
+                    HStack(spacing: 6) {
+                        TextField("", value: $model.capture.bpm, format: .number)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 62)
+                            .font(.mono)
+                        Stepper("", value: $model.capture.bpm, in: 40...240, step: 1)
+                            .labelsHidden()
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("PATTERN").font(.monoSm).foregroundStyle(Color.dimText)
+                    Picker("", selection: $model.capture.patternSteps) {
+                        Text("16").tag(16)
+                        Text("32").tag(32)
+                        Text("64").tag(64)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 130)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("GRID").font(.monoSm).foregroundStyle(Color.dimText)
+                    Picker("", selection: $model.capture.gridDivision) {
+                        Text("1/8").tag(8)
+                        Text("1/16").tag(16)
+                        Text("1/32").tag(32)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 130)
+                }
+
+                Spacer()
+            }
+
+            // Row 2: Mono mode + toggles
+            HStack(spacing: 16) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("MONO").font(.monoSm).foregroundStyle(Color.dimText)
+                    Picker("", selection: $model.capture.monoMode) {
+                        Text("High").tag(CaptureSettings.MonoMode.highest)
+                        Text("Low").tag(CaptureSettings.MonoMode.lowest)
+                        Text("New").tag(CaptureSettings.MonoMode.newest)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 130)
+                }
+
+                Spacer()
+
+                Toggle("Clock", isOn: $model.capture.sendClock)
+                    .font(.mono)
+                    .toggleStyle(.switch)
+                Toggle("Count-In", isOn: $model.capture.countIn)
+                    .font(.mono)
+                    .toggleStyle(.switch)
+                Toggle("Loop", isOn: $model.capture.loop)
+                    .font(.mono)
+                    .toggleStyle(.switch)
+            }
+        }
+        .padding(12)
+        .background(Color.bg2)
+        .cornerRadius(8)
+    }
+
     // MARK: Port picker
 
     private var portSection: some View {
         HStack(spacing: 10) {
             sectionLabel("MIDI Port")
-            Picker("", selection: $model.selectedPort) {
-                if model.availablePorts.isEmpty {
+            Picker("", selection: $selectedPort) {
+                if model.midi.destinations.isEmpty {
                     Text("(no ports found)").tag("")
                 }
-                ForEach(model.availablePorts, id: \.self) { p in
-                    Text(p).tag(p)
+                ForEach(model.midi.destinations, id: \.name) { d in
+                    Text(d.name).tag(d.name)
                 }
             }
             .labelsHidden()
             .frame(maxWidth: 300)
-            Button("Refresh") { Task { await model.refreshPorts() } }
-                .buttonStyle(BSPButtonStyle(small: true))
+            .onAppear {
+                if let bsp = model.midi.bspDestination() { selectedPort = bsp.name }
+                else if let first = model.midi.destinations.first { selectedPort = first.name }
+            }
+            Button("Refresh") {
+                model.refreshPorts()
+                if let bsp = model.midi.bspDestination() { selectedPort = bsp.name }
+            }
+            .buttonStyle(BSPButtonStyle(small: true))
         }
     }
 
-    // MARK: Send button
+    // MARK: Send buttons
 
     private var sendSection: some View {
-        Button {
-            Task { await model.sendTracks() }
-        } label: {
-            HStack(spacing: 8) {
-                if model.isSending {
-                    ProgressView().scaleEffect(0.75).tint(.white)
-                    Text("Sending…")
-                } else {
-                    Image(systemName: "arrow.up.circle.fill")
-                    Text("SEND TO BEATSTEP PRO")
+        let canSend = model.fileURL != nil && !selectedPort.isEmpty && !model.isSending && !model.isLoading
+        return VStack(spacing: 10) {
+            // Individual lane buttons
+            HStack(spacing: 10) {
+                LaneSendButton(label: "SEQ1", subtitle: "Lead", color: Color(red: 0.2, green: 0.6, blue: 1.0),
+                               enabled: canSend && model.seq1Index != nil) {
+                    Task { await model.sendLane("SEQ1", to: selectedPort) }
+                }
+                LaneSendButton(label: "SEQ2", subtitle: "Bass", color: Color(red: 0.4, green: 0.9, blue: 0.5),
+                               enabled: canSend && model.seq2Index != nil) {
+                    Task { await model.sendLane("SEQ2", to: selectedPort) }
+                }
+                LaneSendButton(label: "DRUM", subtitle: "Drums", color: Color(red: 1.0, green: 0.4, blue: 0.6),
+                               enabled: canSend && model.drumIndex != nil) {
+                    Task { await model.sendLane("DRUM", to: selectedPort) }
                 }
             }
-            .font(.system(size: 14, weight: .bold, design: .monospaced))
-            .frame(maxWidth: .infinity, minHeight: 42)
+
+            // Send All + Stop row
+            HStack(spacing: 10) {
+                Button {
+                    Task { await model.sendAllParallel(to: selectedPort) }
+                } label: {
+                    HStack(spacing: 8) {
+                        if model.isSending {
+                            ProgressView().scaleEffect(0.75).tint(.white)
+                            Text("Sending…")
+                        } else {
+                            Image(systemName: "arrow.up.circle.fill")
+                            Text("SEND ALL TO BEATSTEP PRO")
+                        }
+                    }
+                    .font(.system(size: 14, weight: .bold, design: .monospaced))
+                    .frame(maxWidth: .infinity, minHeight: 42)
+                }
+                .buttonStyle(SendButtonStyle())
+                .disabled(!canSend)
+
+                if model.isSending {
+                    Button {
+                        model.stopSending()
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "stop.fill")
+                            Text("STOP")
+                        }
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .frame(minWidth: 90, minHeight: 42)
+                    }
+                    .buttonStyle(StopButtonStyle())
+                }
+            }
         }
-        .buttonStyle(SendButtonStyle())
-        .disabled(model.fileURL == nil || model.selectedPort.isEmpty || model.isSending || model.isLoading)
     }
 
     // MARK: Log
@@ -295,6 +415,38 @@ private struct AssignRow: View {
     }
 }
 
+// MARK: - Lane send button
+
+private struct LaneSendButton: View {
+    let label: String
+    let subtitle: String
+    let color: Color
+    let enabled: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 3) {
+                Text(label)
+                    .font(.system(size: 13, weight: .black, design: .monospaced))
+                Text(subtitle)
+                    .font(.system(size: 10, design: .monospaced))
+                    .opacity(0.8)
+            }
+            .frame(maxWidth: .infinity, minHeight: 48)
+            .background(enabled ? color.opacity(0.2) : Color.white.opacity(0.05))
+            .foregroundStyle(enabled ? color : Color.dimText)
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(enabled ? color.opacity(0.6) : Color.white.opacity(0.1), lineWidth: 1)
+            )
+            .cornerRadius(8)
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+    }
+}
+
 // MARK: - Button styles
 
 private struct BSPButtonStyle: ButtonStyle {
@@ -314,6 +466,16 @@ private struct SendButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .background(configuration.isPressed ? Color.accent.opacity(0.8) : Color.accent)
+            .foregroundStyle(.white)
+            .cornerRadius(8)
+            .opacity(configuration.isPressed ? 0.9 : 1.0)
+    }
+}
+
+private struct StopButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(configuration.isPressed ? Color(red: 0.7, green: 0.1, blue: 0.1) : Color(red: 0.55, green: 0.1, blue: 0.1))
             .foregroundStyle(.white)
             .cornerRadius(8)
             .opacity(configuration.isPressed ? 0.9 : 1.0)

@@ -1,37 +1,96 @@
-//
-//  Beatstep_LoaderTests.swift
-//  Beatstep-LoaderTests
-//
-//  Created by i3bus on 5/2/26.
-//
+import Testing
+@testable import Beatstep_Loader
 
-import XCTest
+struct BeatstepLoaderTests {
+    @Test
+    func longestNoteRuleKeepsLongestDurationAtStep() {
+        let settings = LaneSettings(
+            target: .seq1,
+            bspRecordInputChannel: 1,
+            intendedOutputChannel: 1,
+            patternLengthSteps: 16,
+            grid: .sixteenth,
+            monoRule: .longestNote,
+            velocityMode: .preserve
+        )
 
-final class Beatstep_LoaderTests: XCTestCase {
+        let track = MIDITrackData(
+            index: 0,
+            name: "Lead",
+            channels: [0],
+            noteMin: 60,
+            noteMax: 67,
+            noteCount: 2,
+            events: [
+                noteOn(tick: 0, note: 60, velocity: 96),
+                noteOn(tick: 0, note: 67, velocity: 100),
+                noteOff(tick: 120, note: 67),
+                noteOff(tick: 480, note: 60),
+            ]
+        )
 
-    override func setUpWithError() throws {
-        // Put setup code here. This method is called before the invocation of each test method in the class.
+        let notes = MIDIPreprocessor(lane: settings, ticksPerBeat: 480).process(track)
+
+        #expect(notes.count == 1)
+        #expect(notes.first?.note == 60)
     }
 
-    override func tearDownWithError() throws {
-        // Put teardown code here. This method is called after the invocation of each test method in the class.
+    @Test
+    func drumLaneKeepsPolyphonicHits() {
+        let settings = LaneSettings(
+            target: .drum,
+            bspRecordInputChannel: 10,
+            intendedOutputChannel: 10,
+            patternLengthSteps: 16,
+            grid: .sixteenth,
+            monoRule: .newestNote,
+            velocityMode: .preserve
+        )
+
+        let track = MIDITrackData(
+            index: 1,
+            name: "Drums",
+            channels: [9],
+            noteMin: 36,
+            noteMax: 42,
+            noteCount: 2,
+            events: [
+                noteOn(tick: 0, note: 36, velocity: 110),
+                noteOn(tick: 0, note: 42, velocity: 90),
+                noteOff(tick: 120, note: 36),
+                noteOff(tick: 120, note: 42),
+            ]
+        )
+
+        let notes = MIDIPreprocessor(lane: settings, ticksPerBeat: 480).process(track)
+
+        #expect(notes.count == 2)
+        #expect(Set(notes.map(\.note)) == Set([36, 42]))
     }
 
-    func testExample() throws {
-        // This is an example of a functional test case.
-        // Use XCTAssert and related functions to verify your tests produce the correct results.
-        // Any test you write for XCTest can be annotated as throws and async.
-        // Mark your test throws to produce an unexpected failure when your test encounters an uncaught error.
-        // Mark your test async to allow awaiting for asynchronous code to complete. Check the results with assertions afterwards.
-        // XCTest Documentation
-        // https://developer.apple.com/documentation/xctest
+    private func noteOn(tick: UInt64, note: UInt8, velocity: UInt8) -> RawMIDIEvent {
+        RawMIDIEvent(
+            absoluteTick: tick,
+            isMeta: false,
+            metaType: 0,
+            metaPayload: Data(),
+            statusByte: 0x90,
+            data1: note,
+            data2: velocity,
+            dataLength: 3
+        )
     }
 
-    func testPerformanceExample() throws {
-        // This is an example of a performance test case.
-        measure {
-            // Put the code you want to measure the time of here.
-        }
+    private func noteOff(tick: UInt64, note: UInt8) -> RawMIDIEvent {
+        RawMIDIEvent(
+            absoluteTick: tick,
+            isMeta: false,
+            metaType: 0,
+            metaPayload: Data(),
+            statusByte: 0x80,
+            data1: note,
+            data2: 0,
+            dataLength: 3
+        )
     }
-
 }

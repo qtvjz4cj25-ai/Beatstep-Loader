@@ -8,7 +8,6 @@
 
 import Foundation
 import CoreMIDI
-import Observation
 
 // MARK: - Raw event (for playback)
 
@@ -192,15 +191,12 @@ struct MIDIFileParser {
 
 // MARK: - CoreMIDI engine
 
-@Observable
 final class CoreMIDIEngine {
 
     struct MIDIDestination: Identifiable, Hashable {
         let id: MIDIEndpointRef
         let name: String
     }
-
-    private(set) var destinations: [MIDIDestination] = []
 
     private var client  = MIDIClientRef()
     private var outPort = MIDIPortRef()
@@ -212,7 +208,7 @@ final class CoreMIDIEngine {
 
     // MARK: Port enumeration
 
-    func refreshDestinations() {
+    func refreshDestinations() -> [MIDIDestination] {
         var list = [MIDIDestination]()
         let count = MIDIGetNumberOfDestinations()
         for i in 0..<count {
@@ -222,11 +218,39 @@ final class CoreMIDIEngine {
             let name = (cf?.takeRetainedValue() as String?) ?? "MIDI Output \(i)"
             list.append(MIDIDestination(id: ep, name: name))
         }
-        destinations = list
+        return list
     }
 
-    func bspDestination() -> MIDIDestination? {
+    func bspDestination(in destinations: [MIDIDestination]) -> MIDIDestination? {
         destinations.first { $0.name.localizedCaseInsensitiveContains("beatstep") }
+    }
+
+    func destination(named name: String, in destinations: [MIDIDestination]) -> MIDIDestination? {
+        destinations.first(where: { $0.name == name })
+    }
+
+    // MARK: MIDI output test harness
+
+    func sendNoteOn(note: UInt8, velocity: UInt8, channel: UInt8, to dest: MIDIDestination) {
+        let zeroBasedChannel = max(channel, 1) - 1
+        Self.sendBytes([0x90 | zeroBasedChannel, note, velocity], to: dest.id, outPort: outPort)
+    }
+
+    func sendNoteOff(note: UInt8, channel: UInt8, to dest: MIDIDestination) {
+        let zeroBasedChannel = max(channel, 1) - 1
+        Self.sendBytes([0x80 | zeroBasedChannel, note, 0], to: dest.id, outPort: outPort)
+    }
+
+    func sendStart(to dest: MIDIDestination) {
+        Self.sendBytes([0xFA], to: dest.id, outPort: outPort)
+    }
+
+    func sendStop(to dest: MIDIDestination) {
+        Self.sendBytes([0xFC], to: dest.id, outPort: outPort)
+    }
+
+    func sendClockTick(to dest: MIDIDestination) {
+        Self.sendBytes([0xF8], to: dest.id, outPort: outPort)
     }
 
     // MARK: Real-time send (call from background task)
@@ -259,12 +283,12 @@ final class CoreMIDIEngine {
             guard eventType >= 0x80, eventType < 0xF0 else { continue }
 
             // Re-channel to BSP output lane
-            let newStatus = eventType | (outputChannel & 0x0F)
+            let newStatus = eventType | ((max(outputChannel, 1) - 1) & 0x0F)
             let bytes: [UInt8] = event.dataLength == 2
                 ? [newStatus, event.data1]
                 : [newStatus, event.data1, event.data2]
 
-            sendBytes(bytes, to: dest.id)
+            Self.sendBytes(bytes, to: dest.id, outPort: outPort)
         }
     }
 
@@ -275,16 +299,20 @@ final class CoreMIDIEngine {
     func captureToLane(_ notes: [QuantizedNote],
                        to dest: MIDIDestination,
                        outputChannel: UInt8,
+                       gridTicks: UInt64,
                        ticksPerBeat: UInt16,
                        settings: CaptureSettings,
+                       sendNoteOffs: Bool = true,
                        stopSignal: () -> Bool) async {
-        let nsPerTick    = settings.nsPerBeat / UInt64(ticksPerBeat)
-        let patternNs    = settings.patternTicks(ticksPerBeat: ticksPerBeat) * nsPerTick
-        let countInNs    = settings.countIn ? settings.nsPerBeat * 4 : 0  // 1 bar (4 beats)
+        let nsPerTick = max(settings.nsPerBeat / UInt64(ticksPerBeat), 1)
+        let patternNs = UInt64(notes.map(\.startTick).max() ?? 0) * nsPerTick + (gridTicks * nsPerTick)
+        let countInNs = settings.countInNs
+        let outPort = outPort
+        let destinationID = dest.id
 
         repeat {
             // Transport start
-            if settings.sendClock { sendBytes([0xFA], to: dest.id) }
+            if settings.sendStartStop { sendStart(to: dest) }
 
             // Clock + notes run in parallel
             await withTaskGroup(of: Void.self) { group in
@@ -293,11 +321,10 @@ final class CoreMIDIEngine {
                 if settings.sendClock {
                     let totalNs = countInNs + patternNs
                     let pulse   = settings.nsPerPulse
-                    group.addTask { [weak self] in
-                        guard let self else { return }
+                    group.addTask {
                         var elapsed = UInt64(0)
                         while elapsed < totalNs {
-                            self.sendBytes([0xF8], to: dest.id)
+                            Self.sendBytes([0xF8], to: destinationID, outPort: outPort)
                             try? await Task.sleep(nanoseconds: pulse)
                             elapsed += pulse
                         }
@@ -305,8 +332,7 @@ final class CoreMIDIEngine {
                 }
 
                 // Count-in: silence for 1 bar, then send notes
-                group.addTask { [weak self] in
-                    guard let self else { return }
+                group.addTask {
                     if countInNs > 0 {
                         try? await Task.sleep(nanoseconds: countInNs)
                     }
@@ -317,15 +343,16 @@ final class CoreMIDIEngine {
                             try? await Task.sleep(nanoseconds: noteNs - lastNs)
                         }
                         lastNs = noteNs
-                        // Note on
-                        self.sendBytes([0x90 | outputChannel, note.note, note.velocity], to: dest.id)
-                        // Schedule note off
-                        let offDelay = note.durationTicks * nsPerTick
-                        let noteNum  = note.note
-                        let destId   = dest.id
-                        Task { [weak self] in
-                            try? await Task.sleep(nanoseconds: offDelay)
-                            self?.sendBytes([0x80 | outputChannel, noteNum, 0], to: destId)
+                        let zeroBasedChannel = max(outputChannel, 1) - 1
+                        Self.sendBytes([0x90 | zeroBasedChannel, note.note, note.velocity], to: destinationID, outPort: outPort)
+
+                        if sendNoteOffs {
+                            let offDelay = note.durationTicks * nsPerTick
+                            let noteNum = note.note
+                            Task {
+                                try? await Task.sleep(nanoseconds: offDelay)
+                                Self.sendBytes([0x80 | zeroBasedChannel, noteNum, 0], to: destinationID, outPort: outPort)
+                            }
                         }
                     }
                     // Wait for rest of pattern
@@ -336,19 +363,19 @@ final class CoreMIDIEngine {
             }
 
             // Transport stop
-            if settings.sendClock { sendBytes([0xFC], to: dest.id) }
+            if settings.sendStartStop { sendStop(to: dest) }
 
         } while settings.loop && !stopSignal()
     }
 
     // MARK: Packet send
 
-    func sendBytes(_ bytes: [UInt8], to endpoint: MIDIEndpointRef) {
+    nonisolated private static func sendBytes(_ bytes: [UInt8], to endpoint: MIDIEndpointRef, outPort: MIDIPortRef) {
         let bufSize = MemoryLayout<MIDIPacketList>.size + bytes.count
         var buffer  = [UInt8](repeating: 0, count: bufSize)
         buffer.withUnsafeMutableBytes { raw in
             let listPtr = raw.baseAddress!.assumingMemoryBound(to: MIDIPacketList.self)
-            var packet  = MIDIPacketListInit(listPtr)
+            let packet  = MIDIPacketListInit(listPtr)
             _ = MIDIPacketListAdd(listPtr, bufSize, packet, 0, bytes.count, bytes)
             MIDISend(outPort, endpoint, listPtr)
         }

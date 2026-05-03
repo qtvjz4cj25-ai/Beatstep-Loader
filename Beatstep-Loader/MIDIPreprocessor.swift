@@ -8,40 +8,181 @@
 
 import Foundation
 
+enum TargetLane: String, CaseIterable, Identifiable {
+    case seq1 = "SEQ 1"
+    case seq2 = "SEQ 2"
+    case drum = "DRUM"
+
+    var id: String { rawValue }
+
+    var defaultChannel: UInt8 {
+        switch self {
+        case .seq1: return 1
+        case .seq2: return 2
+        case .drum: return 10
+        }
+    }
+
+    var defaultMonoRule: MonoPriorityRule {
+        switch self {
+        case .seq1: return .lowestNote
+        case .seq2: return .highestNote
+        case .drum: return .newestNote
+        }
+    }
+}
+
+enum MonoPriorityRule: String, CaseIterable, Identifiable {
+    case highestNote = "Highest Note"
+    case lowestNote = "Lowest Note"
+    case newestNote = "Newest Note"
+    case longestNote = "Longest Note"
+
+    var id: String { rawValue }
+}
+
+enum GridResolution: String, CaseIterable, Identifiable {
+    case eighth = "1/8"
+    case sixteenth = "1/16"
+    case thirtySecond = "1/32"
+
+    var id: String { rawValue }
+
+    var stepsPerQuarterNote: Double {
+        switch self {
+        case .eighth: return 2
+        case .sixteenth: return 4
+        case .thirtySecond: return 8
+        }
+    }
+
+    var divisionValue: Int {
+        switch self {
+        case .eighth: return 8
+        case .sixteenth: return 16
+        case .thirtySecond: return 32
+        }
+    }
+}
+
+enum CountInMode: String, CaseIterable, Identifiable {
+    case off = "Off"
+    case oneBar = "1 Bar"
+    case twoBars = "2 Bars"
+
+    var id: String { rawValue }
+
+    var bars: UInt64 {
+        switch self {
+        case .off: return 0
+        case .oneBar: return 1
+        case .twoBars: return 2
+        }
+    }
+}
+
+enum VelocityMode: String, CaseIterable, Identifiable {
+    case preserve = "Preserve"
+    case normalized = "Normalize"
+
+    var id: String { rawValue }
+}
+
+enum VolcaDrumMIDIMode: String, CaseIterable, Identifiable {
+    case singleChannel = "Single Channel"
+    case splitChannel = "Split Channel / Factory Default"
+
+    var id: String { rawValue }
+}
+
+struct MIDINoteEvent: Identifiable, Hashable {
+    let id = UUID()
+    var note: UInt8
+    var velocity: UInt8
+    var startBeat: Double
+    var durationBeats: Double
+    var channel: UInt8
+    var trackName: String?
+}
+
+struct MIDITrackInfo: Identifiable, Hashable {
+    let id = UUID()
+    var name: String
+    var channel: UInt8?
+    var notes: [MIDINoteEvent]
+}
+
+struct BSPPatternLane: Identifiable, Hashable {
+    let id = UUID()
+    var name: String
+    var target: TargetLane
+    var bspRecordInputChannel: UInt8
+    var intendedOutputChannel: UInt8
+    var lengthSteps: Int
+    var grid: GridResolution
+    var notes: [MIDINoteEvent]
+}
+
+struct VolcaDrumPartMapping: Identifiable, Hashable {
+    let id = UUID()
+    var partNumber: Int
+    var sourceNote: UInt8
+    var outputNote: UInt8
+    var outputChannel: UInt8
+}
+
+struct VolcaDrumProfile: Hashable {
+    var mode: VolcaDrumMIDIMode = .singleChannel
+    var singleChannel: UInt8 = 10
+    var rxShortMessageEnabled = false
+    var clockSourceAuto = true
+    var partMappings: [VolcaDrumPartMapping] = [
+        VolcaDrumPartMapping(partNumber: 1, sourceNote: 36, outputNote: 36, outputChannel: 1),
+        VolcaDrumPartMapping(partNumber: 2, sourceNote: 38, outputNote: 38, outputChannel: 2),
+        VolcaDrumPartMapping(partNumber: 3, sourceNote: 42, outputNote: 42, outputChannel: 3),
+        VolcaDrumPartMapping(partNumber: 4, sourceNote: 46, outputNote: 46, outputChannel: 4),
+        VolcaDrumPartMapping(partNumber: 5, sourceNote: 45, outputNote: 45, outputChannel: 5),
+        VolcaDrumPartMapping(partNumber: 6, sourceNote: 39, outputNote: 39, outputChannel: 6),
+    ]
+}
+
+struct LaneSettings: Identifiable, Hashable {
+    let id = UUID()
+    var target: TargetLane
+    var bspRecordInputChannel: UInt8
+    var intendedOutputChannel: UInt8
+    var patternLengthSteps: Int
+    var grid: GridResolution
+    var monoRule: MonoPriorityRule
+    var velocityMode: VelocityMode
+
+    static func preset(for target: TargetLane) -> LaneSettings {
+        LaneSettings(
+            target: target,
+            bspRecordInputChannel: target.defaultChannel,
+            intendedOutputChannel: target.defaultChannel,
+            patternLengthSteps: 16,
+            grid: .sixteenth,
+            monoRule: target.defaultMonoRule,
+            velocityMode: .preserve
+        )
+    }
+}
+
 // MARK: - Settings
 
 struct CaptureSettings {
-    var bpm: Double      = 120
-    var patternSteps: Int = 16    // 16, 32, 64
-    var gridDivision: Int = 16    // 8, 16, or 32  (1/8, 1/16, 1/32)
-    var monoMode: MonoMode = .highest
-    var countIn: Bool    = true   // 1-bar count-in before notes start
-    var loop: Bool       = false  // repeat pattern until stopped
-    var sendClock: Bool  = true   // send MIDI clock (24 PPQN)
+    var bpm: Double = 120
+    var countIn: CountInMode = .oneBar
+    var loop = false
+    var sendClock = true
+    var sendStartStop = true
 
-    enum MonoMode: String, CaseIterable, Identifiable {
-        case highest = "Highest"
-        case lowest  = "Lowest"
-        case newest  = "Newest"
-        var id: String { rawValue }
-    }
-
-    /// Ticks per grid step at a given file resolution
-    func gridTicks(ticksPerBeat: UInt16) -> UInt64 {
-        // 1 beat = ticksPerBeat ticks; 1/gridDivision note = ticksPerBeat * 4 / gridDivision
-        UInt64(ticksPerBeat) * 4 / UInt64(gridDivision)
-    }
-
-    /// Total ticks in the pattern
-    func patternTicks(ticksPerBeat: UInt16) -> UInt64 {
-        gridTicks(ticksPerBeat: ticksPerBeat) * UInt64(patternSteps)
-    }
-
-    /// Nanoseconds per beat
     var nsPerBeat: UInt64 { UInt64(60_000_000_000.0 / bpm) }
-
-    /// Nanoseconds per MIDI clock pulse (24 PPQN)
     var nsPerPulse: UInt64 { nsPerBeat / 24 }
+    var beatsPerBar: UInt64 { 4 }
+    var countInBeats: UInt64 { countIn.bars * beatsPerBar }
+    var countInNs: UInt64 { nsPerBeat * countInBeats }
 }
 
 // MARK: - Processed note
@@ -57,19 +198,36 @@ struct QuantizedNote {
 
 struct MIDIPreprocessor {
 
-    let settings: CaptureSettings
+    let lane: LaneSettings
     let ticksPerBeat: UInt16
 
-    private var gridTicks:    UInt64 { settings.gridTicks(ticksPerBeat: ticksPerBeat) }
-    private var patternTicks: UInt64 { settings.patternTicks(ticksPerBeat: ticksPerBeat) }
+    private var gridTicks: UInt64 {
+        UInt64(Double(ticksPerBeat) / lane.grid.stepsPerQuarterNote)
+    }
+
+    private var patternTicks: UInt64 {
+        gridTicks * UInt64(lane.patternLengthSteps)
+    }
 
     // MARK: Main pipeline
 
     func process(_ trackData: MIDITrackData) -> [QuantizedNote] {
-        let pairs    = extractNotePairs(trackData)
+        let pairs = extractNotePairs(trackData)
         let quantized = pairs.map { quantize($0) }
-        let clipped  = clip(quantized)
-        let mono     = reduceMono(clipped)
+        let clipped = clip(quantized)
+
+        if lane.target == .drum {
+            return clipped.map { drumNote in
+                QuantizedNote(
+                    startTick: drumNote.startTick,
+                    durationTicks: gridTicks,
+                    note: drumNote.note,
+                    velocity: normalizeVelocityIfNeeded(drumNote.velocity)
+                )
+            }
+        }
+
+        let mono = reduceMono(clipped)
         return resolveOverlaps(mono)
     }
 
@@ -141,10 +299,15 @@ struct MIDIPreprocessor {
         for n in notes { byTick[n.startTick, default: []].append(n) }
 
         return byTick.sorted { $0.key < $1.key }.map { (_, group) in
-            switch settings.monoMode {
-            case .highest: return group.max(by: { $0.note < $1.note })!
-            case .lowest:  return group.min(by: { $0.note < $1.note })!
-            case .newest:  return group.last!
+            switch lane.monoRule {
+            case .highestNote:
+                return group.max(by: { $0.note < $1.note })!
+            case .lowestNote:
+                return group.min(by: { $0.note < $1.note })!
+            case .newestNote:
+                return group.max(by: { $0.startTick < $1.startTick })!
+            case .longestNote:
+                return group.max(by: { $0.durationTicks < $1.durationTicks })!
             }
         }
     }
@@ -153,7 +316,7 @@ struct MIDIPreprocessor {
 
     private func resolveOverlaps(_ notes: [RawNote]) -> [QuantizedNote] {
         var result = [QuantizedNote]()
-        var sorted = notes.sorted { $0.startTick < $1.startTick }
+        let sorted = notes.sorted { $0.startTick < $1.startTick }
 
         for i in sorted.indices {
             let cur  = sorted[i]
@@ -166,8 +329,13 @@ struct MIDIPreprocessor {
             }
             result.append(QuantizedNote(startTick: cur.startTick,
                                         durationTicks: max(dur, gridTicks),
-                                        note: cur.note, velocity: cur.velocity))
+                                        note: cur.note,
+                                        velocity: normalizeVelocityIfNeeded(cur.velocity)))
         }
         return result
+    }
+
+    private func normalizeVelocityIfNeeded(_ velocity: UInt8) -> UInt8 {
+        lane.velocityMode == .normalized ? 100 : velocity
     }
 }
